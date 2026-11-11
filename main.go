@@ -25,6 +25,7 @@ var listenAddrs = []string{"127.0.0.1:443", "[::1]:443"}
 const usage = `ythider: YouTube as a search bar, gated by a local model.
 
   sudo ythider install [--cooloff 24h|never] [--model NAME]
+  sudo ythider upgrade            replace the running daemon with this build
   sudo ythider status
   sudo ythider request-unlock     start the cool-off before the password can be revealed
   sudo ythider cancel-unlock      change your mind
@@ -43,6 +44,7 @@ func main() {
 	cmds := map[string]func([]string) error{
 		"serve":          cmdServe,
 		"install":        cmdInstall,
+		"upgrade":        cmdUpgrade,
 		"status":         cmdStatus,
 		"request-unlock": cmdRequestUnlock,
 		"cancel-unlock":  cmdCancelUnlock,
@@ -163,6 +165,14 @@ func loadLock() (*store, *lock, error) {
 		return nil, nil, errors.New("not installed")
 	}
 	return st, lk, nil
+}
+
+func cmdUpgrade([]string) error {
+	if err := upgrade(&store{dir: defaultStateDir}); err != nil {
+		return err
+	}
+	fmt.Println("Upgraded and restarted. Reload any open YouTube tabs.")
+	return nil
 }
 
 func cmdStatus([]string) error {
@@ -297,9 +307,11 @@ func cmdRelock([]string) error {
 	return nil
 }
 
-// cmdEval measures the classifier against labeled queries, one per line:
-// "allow<TAB>query" or "block<TAB>query". It reports agreement and latency,
-// which is the only honest way to pick a model or tune a policy.
+// cmdEval measures the classifier against labeled lines. A search is
+// "allow<TAB>query" or "block<TAB>query"; a video adds columns:
+// "allow<TAB>title<TAB>channel<TAB>category" (category optional). It reports
+// agreement and latency, which is the only honest way to pick a model or
+// tune a policy.
 func cmdEval(args []string) error {
 	fs := flag.NewFlagSet("eval", flag.ExitOnError)
 	policyPath := fs.String("policy", "", `policy JSON file: {"allowed": "...", "blocked": "..."}`)
@@ -325,19 +337,27 @@ func cmdEval(args []string) error {
 
 	cls := newOllamaClassifier(config{Model: *model, Ollama: *ollama})
 	ctx := context.Background()
-	if _, err := cls.classify(ctx, p, "warm up"); err != nil {
+	if _, err := cls.classify(ctx, p, searchItem("warm up").subject()); err != nil {
 		return err
 	}
 	var times []time.Duration
-	var n, agree, wrongAllow, wrongBlock int
+	var n, agree, wrongAllow, wrongBlock, appealable int
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		label, query, ok := strings.Cut(sc.Text(), "\t")
-		if !ok || (label != "allow" && label != "block") {
+		cols := strings.Split(sc.Text(), "\t")
+		if len(cols) < 2 || (cols[0] != "allow" && cols[0] != "block") {
 			continue
 		}
+		label, query := cols[0], cols[1]
+		it := searchItem(query)
+		if len(cols) >= 3 {
+			it = item{Kind: "video", Title: cols[1], Channel: cols[2]}
+			if len(cols) >= 4 {
+				it.Detail = cols[3]
+			}
+		}
 		start := time.Now()
-		v, err := cls.classify(ctx, p, query)
+		v, err := cls.classify(ctx, p, it.subject())
 		if err != nil {
 			return err
 		}
@@ -348,17 +368,20 @@ func cmdEval(args []string) error {
 			agree++
 		case v.Allow:
 			wrongAllow++
-			fmt.Printf("let through, labeled block:  %-40s %s\n", query, v.Reason)
+			fmt.Printf("let through, labeled block:  %-40s %d%% %s\n", query, v.Confidence, v.Reason)
 		default:
 			wrongBlock++
-			fmt.Printf("kept out, labeled allow:     %-40s %s\n", query, v.Reason)
+			if v.Confidence < appealBelow {
+				appealable++
+			}
+			fmt.Printf("kept out, labeled allow:     %-40s %d%% %s\n", query, v.Confidence, v.Reason)
 		}
 	}
 	if n == 0 {
 		return errors.New("no labeled queries found")
 	}
 	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
-	fmt.Printf("\n%s: %d/%d agree (%.0f%%); %d wrongly let through, %d wrongly kept out\n", *model, agree, n, 100*float64(agree)/float64(n), wrongAllow, wrongBlock)
+	fmt.Printf("\n%s: %d/%d agree (%.0f%%); %d wrongly let through, %d wrongly kept out (%d of those could be appealed)\n", *model, agree, n, 100*float64(agree)/float64(n), wrongAllow, wrongBlock, appealable)
 	fmt.Printf("latency: median %s, p95 %s\n", times[n/2].Round(time.Millisecond), times[min(n-1, n*95/100)].Round(time.Millisecond))
 	return nil
 }

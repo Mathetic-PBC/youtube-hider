@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"html/template"
@@ -14,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,14 @@ func mustAsset(name string) []byte {
 // the request carrying it has already been refused.
 const gotoHeader = "X-Hider-Goto"
 
+const (
+	// A block the model is less sure of than this can be appealed.
+	appealBelow = 95
+	// An appeal has to say something: this many characters, this many words.
+	appealMinChars = 250
+	appealMinWords = 20
+)
+
 // Feeds that exist to recommend. Navigating to them lands on the search bar.
 var blockedPaths = []string{"/shorts", "/feed/trending", "/feed/subscriptions", "/feed/explore", "/feed/news_destination", "/feed/storefront", "/gaming", "/hashtag"}
 
@@ -59,20 +68,59 @@ type server struct {
 	cls   classifier
 	proxy *httputil.ReverseProxy
 
-	mu     sync.RWMutex
-	policy policy
+	mu      sync.RWMutex
+	policy  policy
+	memo    map[string]judged  // verdicts by item key, for the current policy
+	grants  map[string]grant   // accepted appeals by item key
+	pending map[string]pending // blocks that may be appealed, by token
 }
 
-type modeKey struct{}
+// judged is a verdict together with what was judged.
+type judged struct {
+	verdict
+	item item
+}
+
+// grant is an accepted appeal. Grants are kept, with the text, so that what
+// was let through and why can be read back later.
+type grant struct {
+	Key  string    `json:"key"`
+	What string    `json:"what"`
+	Why  string    `json:"why"`
+	At   time.Time `json:"at"`
+}
+
+type pending struct {
+	item item
+	back string
+}
+
+// plan is what the response handler should do with an upstream response.
+type plan struct {
+	mode  pruneMode
+	judge bool   // classify the video, channel or playlist the response carries
+	back  string // in-page request: the page to load if it is blocked
+	watch bool   // in-page request for a video: the page is its watch URL
+}
+
+type planKey struct{}
 
 func newServer(st *store, cls classifier, upstream http.RoundTripper) *server {
-	s := &server{store: st, cls: cls, policy: st.policy()}
+	s := &server{
+		store: st, cls: cls, policy: st.policy(),
+		memo: map[string]judged{}, grants: map[string]grant{}, pending: map[string]pending{},
+	}
+	var saved []grant
+	st.read("appeals.json", &saved)
+	for _, g := range saved {
+		s.grants[g.Key] = g
+	}
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = "https"
 			pr.Out.URL.Host = pr.In.Host
 			pr.Out.Host = pr.In.Host
-			if _, ok := pr.In.Context().Value(modeKey{}).(pruneMode); ok {
+			if _, ok := pr.In.Context().Value(planKey{}).(plan); ok {
 				// Let the transport negotiate gzip so the body can be rewritten.
 				pr.Out.Header.Del("Accept-Encoding")
 			}
@@ -137,8 +185,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
-	if path == "/__hider/onboard" {
+	switch path {
+	case "/__hider/onboard":
 		s.onboard(w, r)
+		return
+	case "/__hider/appeal":
+		s.appeal(w, r)
 		return
 	}
 	nav := isNavigation(r)
@@ -153,7 +205,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode, rewrite := pruneNone, false
+	var pl plan
+	rewrite := false
 	switch {
 	case top && path == "/" && host == "www.youtube.com":
 		s.page(w, http.StatusOK, "home.html", nil)
@@ -173,17 +226,32 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !s.gateSearch(w, r, q, false) {
 			return
 		}
-		mode, rewrite = pruneSearch, true
+		pl, rewrite = plan{mode: pruneSearch}, true
 	case nav && path == "/watch":
-		mode, rewrite = pruneWatch, true
+		// A video already judged and blocked never reaches YouTube again.
+		if j, ok := s.remembered("video:" + r.URL.Query().Get("v")); ok && !j.Allow {
+			s.blocked(w, j.item, j.verdict, nil, r.URL.RequestURI())
+			return
+		}
+		pl, rewrite = plan{mode: pruneWatch, judge: true}, true
 	case nav:
-		rewrite = true
+		// Channel pages, playlists, and anything else that embeds a video.
+		pl, rewrite = plan{judge: true}, true
 	case path == "/sw.js":
 		// YouTube's service worker could answer navigations from its own
 		// cache, bypassing the proxy. Replace it with one that removes itself.
 		w.Header().Set("Content-Type", "text/javascript")
 		w.Header().Set("Cache-Control", "no-store")
 		io.WriteString(w, "self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.registration.unregister()));")
+		return
+	case path == "/complete/search":
+		// Search suggestions: the box takes what is typed and proposes nothing.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	case r.Method == http.MethodPost && path == "/youtubei/v1/guide":
+		// The side navigation's contents: subscriptions, feeds, "Explore".
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"items":[]}`)
 		return
 	case hasPathPrefix(path, "/youtubei/v1/reel"):
 		refuse(w, "/")
@@ -200,7 +268,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if body.Query != "" && !s.gateSearch(w, r, body.Query, true) {
 			return
 		}
-		mode, rewrite = pruneSearch, true
+		pl, rewrite = plan{mode: pruneSearch}, true
 	case r.Method == http.MethodPost && path == "/youtubei/v1/browse":
 		var body struct {
 			BrowseID string `json:"browseId"`
@@ -213,13 +281,21 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			refuse(w, "/")
 			return
 		}
-	case r.Method == http.MethodPost && (path == "/youtubei/v1/next" || path == "/youtubei/v1/get_watch"):
-		// The two calls that deliver watch-page data during in-page navigation.
-		mode, rewrite = pruneWatch, true
+		// In-page navigation to a channel or playlist.
+		pl, rewrite = plan{judge: true, back: browsePage(body.BrowseID)}, true
+	case r.Method == http.MethodPost && path == "/youtubei/v1/get_watch":
+		// In-page navigation to a video: player data and watch-page data.
+		pl, rewrite = plan{mode: pruneWatch, judge: true, watch: true}, true
+	case r.Method == http.MethodPost && path == "/youtubei/v1/player":
+		// Player data on its own: embeds, hover previews. No video plays
+		// without one of these responses, so judging them covers every route.
+		pl, rewrite = plan{judge: true}, true
+	case r.Method == http.MethodPost && path == "/youtubei/v1/next":
+		pl, rewrite = plan{mode: pruneWatch}, true
 	}
 
 	if rewrite {
-		r = r.WithContext(context.WithValue(r.Context(), modeKey{}, mode))
+		r = r.WithContext(context.WithValue(r.Context(), planKey{}, pl))
 	}
 	s.proxy.ServeHTTP(w, r)
 }
@@ -233,13 +309,29 @@ func blockedPath(path string) bool {
 	return false
 }
 
+// browsePage maps the id of an in-page browse request to the page it stands
+// for, so a blocked one can be reloaded as a page that says so.
+func browsePage(id string) string {
+	switch {
+	case strings.HasPrefix(id, "UC"):
+		return "/channel/" + id
+	case strings.HasPrefix(id, "VL"):
+		return "/playlist?list=" + strings.TrimPrefix(id, "VL")
+	}
+	return ""
+}
+
+const refusal = `{"error":{"code":403,"message":"youtube-hider"}}`
+
 // refuse answers an in-page API call that will not be served, pointing the
 // injected script at the page to load instead.
 func refuse(w http.ResponseWriter, to string) {
-	w.Header().Set(gotoHeader, to)
+	if to != "" {
+		w.Header().Set(gotoHeader, to)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
-	io.WriteString(w, `{"error":{"code":403,"message":"youtube-hider"}}`)
+	io.WriteString(w, refusal)
 }
 
 // peekJSON decodes a request body and puts it back, untouched, for the
@@ -265,57 +357,204 @@ func peekJSON(r *http.Request, v any) bool {
 	return json.Unmarshal(plain, v) == nil
 }
 
+// remembered returns a stored verdict for an item that has no accepted appeal.
+func (s *server) remembered(key string) (judged, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.grants[key]; ok {
+		return judged{}, false
+	}
+	j, ok := s.memo[key]
+	return j, ok
+}
+
+// judge classifies an item once per policy and remembers the verdict, so
+// every route to the same thing gets the same answer. An accepted appeal
+// overrides the model.
+func (s *server) judge(ctx context.Context, it item) (verdict, error) {
+	key := it.key()
+	s.mu.RLock()
+	_, granted := s.grants[key]
+	j, known := s.memo[key]
+	s.mu.RUnlock()
+	if granted {
+		return verdict{Allow: true, Confidence: 100, Reason: "Let through on appeal."}, nil
+	}
+	if known {
+		return j.verdict, nil
+	}
+	start := time.Now()
+	v, err := s.cls.classify(ctx, s.currentPolicy(), it.subject())
+	if err != nil {
+		return v, err
+	}
+	word := "blocked"
+	if v.Allow {
+		word = "allowed"
+	}
+	log.Printf("%s %s (confidence %d) in %s", it.Kind, word, v.Confidence, time.Since(start).Round(time.Millisecond))
+	s.mu.Lock()
+	if len(s.memo) > 5000 {
+		clear(s.memo)
+	}
+	s.memo[key] = judged{verdict: v, item: it}
+	s.mu.Unlock()
+	return v, nil
+}
+
 // gateSearch classifies a query and reports whether the search may proceed.
 // When it may not, the response has been written. The proxy fails closed: a
 // classifier that cannot answer blocks the search.
 func (s *server) gateSearch(w http.ResponseWriter, r *http.Request, q string, api bool) bool {
-	start := time.Now()
-	v, err := s.cls.classify(r.Context(), s.currentPolicy(), q)
+	it := searchItem(q)
+	v, err := s.judge(r.Context(), it)
 	if err == nil && v.Allow {
-		log.Printf("search allowed in %s", time.Since(start).Round(time.Millisecond))
 		return true
 	}
 	if err != nil {
 		log.Printf("classifier: %v", err)
-	} else {
-		log.Printf("search blocked in %s", time.Since(start).Round(time.Millisecond))
 	}
+	back := "/results?search_query=" + queryEscape(it.Title)
 	if api {
-		refuse(w, "/results?search_query="+url.QueryEscape(q))
-		return false
+		refuse(w, back)
+	} else {
+		s.blocked(w, it, v, err, back)
 	}
-	data := map[string]any{"Query": q, "Reason": v.Reason}
-	if err != nil {
-		data["Error"] = err.Error()
-		s.page(w, http.StatusServiceUnavailable, "blocked.html", data)
-		return false
-	}
-	s.page(w, http.StatusForbidden, "blocked.html", data)
 	return false
 }
 
-func (s *server) page(w http.ResponseWriter, status int, name string, data any) {
-	var buf bytes.Buffer
-	if err := pages.ExecuteTemplate(&buf, name, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+// blockedPage renders the page shown in place of something not approved.
+// When the model was unsure, the page carries an appeal form.
+func (s *server) blockedPage(it item, v verdict, err error, back string, form map[string]any) (int, []byte) {
+	data := map[string]any{
+		"Kind": it.Kind, "Title": it.Title, "Channel": it.Channel,
+		"Reason": v.Reason, "Confidence": v.Confidence, "MinChars": appealMinChars,
+	}
+	status := http.StatusForbidden
+	switch {
+	case err != nil:
+		status = http.StatusServiceUnavailable
+		data["Error"] = err.Error()
+	case form != nil:
+		// Re-rendering a submitted appeal: keep its token.
+	case v.Confidence < appealBelow:
+		data["Token"] = s.offerAppeal(it, back)
+	}
+	for k, val := range form {
+		data[k] = val
+	}
+	body, _ := renderPage("blocked.html", data)
+	return status, body
+}
+
+func (s *server) blocked(w http.ResponseWriter, it item, v verdict, err error, back string) {
+	status, body := s.blockedPage(it, v, err, back, nil)
+	setPageHeaders(w.Header())
+	w.WriteHeader(status)
+	w.Write(body)
+}
+
+func (s *server) offerAppeal(it item, back string) string {
+	var b [16]byte
+	rand.Read(b[:])
+	token := hex.EncodeToString(b[:])
+	s.mu.Lock()
+	if len(s.pending) > 500 {
+		clear(s.pending)
+	}
+	s.pending[token] = pending{item: it, back: back}
+	s.mu.Unlock()
+	return token
+}
+
+// appeal accepts a written case for something the model blocked without
+// being sure. The friction is the point: the text has to be long enough to
+// have been thought about, and it is kept.
+func (s *server) appeal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+		http.Error(w, "youtube-hider: appeals come from the blocked page", http.StatusForbidden)
 		return
 	}
-	h := w.Header()
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	token := r.PostFormValue("token")
+	why := strings.TrimSpace(r.PostFormValue("why"))
+	s.mu.RLock()
+	p, ok := s.pending[token]
+	j, judgedBefore := s.memo[p.item.key()]
+	s.mu.RUnlock()
+	if !ok || !judgedBefore || j.Allow || j.Confidence >= appealBelow {
+		http.Redirect(w, r, "https://www.youtube.com/", http.StatusSeeOther)
+		return
+	}
+	if problem := appealProblem(why); problem != "" {
+		status, body := s.blockedPage(p.item, j.verdict, nil, p.back, map[string]any{"Token": token, "Why": why, "AppealError": problem})
+		setPageHeaders(w.Header())
+		w.WriteHeader(status)
+		w.Write(body)
+		return
+	}
+	g := grant{Key: p.item.key(), What: p.item.label(), Why: why, At: time.Now()}
+	s.mu.Lock()
+	s.grants[g.Key] = g
+	delete(s.pending, token)
+	all := make([]grant, 0, len(s.grants))
+	for _, each := range s.grants {
+		all = append(all, each)
+	}
+	s.mu.Unlock()
+	if err := s.store.write("appeals.json", all); err != nil {
+		log.Printf("appeals: %v", err)
+	}
+	log.Printf("%s let through on appeal", p.item.Kind)
+	http.Redirect(w, r, "https://www.youtube.com"+p.back, http.StatusSeeOther)
+}
+
+func appealProblem(why string) string {
+	if n := len([]rune(why)); n < appealMinChars {
+		return "That is " + strconv.Itoa(n) + " characters. An appeal needs at least " + strconv.Itoa(appealMinChars) + "."
+	}
+	words := map[string]bool{}
+	for _, w := range strings.Fields(strings.ToLower(why)) {
+		words[w] = true
+	}
+	if len(words) < appealMinWords {
+		return "Say why you want this and what you are looking for, in your own words."
+	}
+	return ""
+}
+
+func renderPage(name string, data any) ([]byte, error) {
+	var buf bytes.Buffer
+	err := pages.ExecuteTemplate(&buf, name, data)
+	return buf.Bytes(), err
+}
+
+func setPageHeaders(h http.Header) {
 	h.Set("Content-Type", "text/html; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
 	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
-	w.WriteHeader(status)
-	w.Write(buf.Bytes())
 }
 
-// onboard serves the form where the user writes their own policy. The first
-// save is open; every later change needs the unlock password.
+func (s *server) page(w http.ResponseWriter, status int, name string, data any) {
+	body, err := renderPage(name, data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	setPageHeaders(w.Header())
+	w.WriteHeader(status)
+	w.Write(body)
+}
+
+// onboard serves the policy page. The first save writes both descriptions.
+// After that, adding to either one is open, and rewriting or removing
+// anything needs the unlock password.
 func (s *server) onboard(w http.ResponseWriter, r *http.Request) {
 	current := s.currentPolicy()
 	lk, lockErr := s.store.lock()
-	locked := !current.empty() && (lk != nil || lockErr != nil)
+	locked := lk != nil || lockErr != nil
 	data := map[string]any{
-		"Policy": current, "Locked": locked,
+		"Policy": current, "Rewrite": current, "Exists": !current.empty(), "Locked": locked,
 		"AllowPills": allowPills, "BlockPills": blockPills,
 	}
 	if r.Method != http.MethodPost {
@@ -327,17 +566,27 @@ func (s *server) onboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	next := policy{
-		Allowed: strings.TrimSpace(r.PostFormValue("allowed")),
-		Blocked: strings.TrimSpace(r.PostFormValue("blocked")),
-	}
-	data["Policy"] = next
-	switch {
-	case next.Allowed == "" || next.Blocked == "":
-		data["Error"] = "Both descriptions are needed. The model has nothing else to go on."
-	case locked && (lk == nil || !lk.verify(r.PostFormValue("password"))):
-		time.Sleep(time.Second)
-		data["Error"] = "Wrong password. Changing the policy needs the unlock password."
+	field := func(name string) string { return strings.TrimSpace(r.PostFormValue(name)) }
+
+	next := current
+	if !current.empty() && r.PostFormValue("action") != "rewrite" {
+		// Adding only ever appends; nothing already written can be lost.
+		addAllowed, addBlocked := field("add_allowed"), field("add_blocked")
+		if addAllowed == "" && addBlocked == "" {
+			data["Error"] = "Nothing to add."
+		}
+		next.Allowed = appendLine(current.Allowed, addAllowed)
+		next.Blocked = appendLine(current.Blocked, addBlocked)
+	} else {
+		next = policy{Allowed: field("allowed"), Blocked: field("blocked")}
+		data["Rewrite"], data["Rewriting"] = next, true
+		switch {
+		case next.Allowed == "" || next.Blocked == "":
+			data["Error"] = "Both descriptions are needed. The model has nothing else to go on."
+		case !current.empty() && locked && (lk == nil || !lk.verify(r.PostFormValue("password"))):
+			time.Sleep(time.Second)
+			data["Error"] = "Wrong password. Rewriting or removing needs the unlock password."
+		}
 	}
 	if data["Error"] != nil {
 		s.page(w, http.StatusBadRequest, "onboard.html", data)
@@ -350,9 +599,17 @@ func (s *server) onboard(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.policy = next
+	clear(s.memo)
 	s.mu.Unlock()
 	go s.warm()
 	http.Redirect(w, r, "https://www.youtube.com/", http.StatusSeeOther)
+}
+
+func appendLine(text, add string) string {
+	if add == "" {
+		return text
+	}
+	return strings.TrimSpace(text + "\n" + add)
 }
 
 // warm loads the model into memory so the first real search is fast.
@@ -363,7 +620,7 @@ func (s *server) warm() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if _, err := s.cls.classify(ctx, p, "warm up"); err != nil {
+	if _, err := s.cls.classify(ctx, p, searchItem("warm up").subject()); err != nil {
 		log.Printf("classifier warm-up: %v", err)
 	}
 }
@@ -371,14 +628,13 @@ func (s *server) warm() {
 func (s *server) modifyResponse(resp *http.Response) error {
 	// HTTP/3 would be attempted against loopback, where nothing listens.
 	resp.Header.Del("Alt-Svc")
-	mode, ok := resp.Request.Context().Value(modeKey{}).(pruneMode)
+	pl, ok := resp.Request.Context().Value(planKey{}).(plan)
 	if !ok || resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Encoding") != "" {
 		return nil
 	}
 	ct := resp.Header.Get("Content-Type")
 	isHTML := strings.HasPrefix(ct, "text/html")
-	isJSON := strings.HasPrefix(ct, "application/json")
-	if !isHTML && !(isJSON && mode != pruneNone) {
+	if !isHTML && !strings.HasPrefix(ct, "application/json") {
 		return nil
 	}
 	body, err := io.ReadAll(resp.Body)
@@ -386,14 +642,51 @@ func (s *server) modifyResponse(resp *http.Response) error {
 	if err != nil {
 		return err
 	}
-	if isHTML {
-		body = rewriteHTML(body, mode, injectCSS, injectJS)
-	} else {
-		body = pruneJSON(body, mode)
+	setBody := func(b []byte) {
+		resp.Body = io.NopCloser(bytes.NewReader(b))
+		resp.ContentLength = int64(len(b))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(b)))
 	}
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+
+	if pl.judge {
+		it, found, err := findItem(body, isHTML)
+		var v verdict
+		if err == nil && found {
+			v, err = s.judge(resp.Request.Context(), it)
+		}
+		if err != nil || (found && !v.Allow) {
+			// Fail closed: something that cannot be judged is not shown.
+			if err != nil {
+				log.Printf("check: %v", err)
+			}
+			resp.Header = http.Header{}
+			if isHTML {
+				status, page := s.blockedPage(it, v, err, resp.Request.URL.RequestURI(), nil)
+				resp.StatusCode, resp.Status = status, http.StatusText(status)
+				setPageHeaders(resp.Header)
+				setBody(page)
+				return nil
+			}
+			back := pl.back
+			if pl.watch && it.ID != "" {
+				back = "/watch?v=" + queryEscape(it.ID)
+			}
+			resp.StatusCode, resp.Status = http.StatusForbidden, http.StatusText(http.StatusForbidden)
+			resp.Header.Set("Content-Type", "application/json")
+			if back != "" {
+				resp.Header.Set(gotoHeader, back)
+			}
+			setBody([]byte(refusal))
+			return nil
+		}
+	}
+
+	if isHTML {
+		body = rewriteHTML(body, pl.mode, injectCSS, injectJS)
+	} else {
+		body = pruneJSON(body, pl.mode)
+	}
+	setBody(body)
 	return nil
 }
 
@@ -414,8 +707,8 @@ func (s *server) listenAndServe(addrs []string, ca *authority) error {
 	return <-errc
 }
 
-// Suggestions offered during onboarding. They are prompts for the user's own
-// writing, not a default policy: nothing is allowed or blocked until saved.
+// Suggestions offered on the policy page. They are prompts for the user's
+// own writing, not a default policy: nothing is allowed or blocked until saved.
 var (
 	allowPills = []string{"Talks", "Lectures", "Math", "Computer science", "History of computing", "Research seminars", "Science", "Philosophy", "Programming tutorials", "Long interviews with researchers"}
 	blockPills = []string{"Politics", "News", "Vlogs", "Challenge videos", "Tech reviews", "Gaming", "Celebrity gossip", "Sports highlights", "Reaction videos", "Infotainment documentaries"}

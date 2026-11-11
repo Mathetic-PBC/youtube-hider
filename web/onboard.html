@@ -3,51 +3,88 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Set up YouTube</title>
+<title>{{if .Exists}}What belongs on YouTube{{else}}Set up YouTube{{end}}</title>
 {{template "style"}}
 <style>
 main{padding:56px 0 72px}
-label{display:block;font-weight:600;margin:28px 0 2px}
+label,h2{display:block;font-size:16px;font-weight:600;margin:28px 0 2px}
 .hint{font-size:14px;margin:0 0 10px}
+.current{white-space:pre-wrap;margin:0 0 12px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;color:var(--fg)}
+.add{min-height:64px}
 .pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .pills button{height:32px;padding:0 12px;border-radius:16px;border:1px solid var(--line);background:transparent;color:var(--fg);font-size:14px}
 .pills button:hover{border-color:var(--fg)}
 .pills button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
 .save{margin-top:32px;height:44px;padding:0 22px;border-radius:22px;border:0;background:var(--accent);color:var(--on-accent);font-weight:600}
 .note{font-size:14px;margin:14px 0 0}
+details.rewrite{margin-top:48px;padding-top:24px;border-top:1px solid var(--line)}
+details.rewrite summary{cursor:pointer;font-weight:600;width:fit-content}
 </style>
 </head>
 <body>
 <main>
+{{if .Exists}}
+<h1>What belongs on your YouTube</h1>
+<p>You can add to either description at any time. When something is in both, it is kept out. Taking anything back out needs the unlock password.</p>
+{{if and .Error (not .Rewriting)}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+<form method="post" action="/__hider/onboard">
+<input type="hidden" name="action" value="add">
+<h2>Let through</h2>
+<p class="current">{{.Policy.Allowed}}</p>
+<textarea class="add" id="add_allowed" name="add_allowed" aria-label="Add to what is let through" placeholder="Add…"></textarea>
+<div class="pills" data-for="add_allowed" aria-label="Suggestions to let through">
+{{range .AllowPills}}<button type="button" aria-pressed="false">{{.}}</button>{{end}}
+</div>
+<h2>Keep out</h2>
+<p class="current">{{.Policy.Blocked}}</p>
+<textarea class="add" id="add_blocked" name="add_blocked" aria-label="Add to what is kept out" placeholder="Add…"></textarea>
+<div class="pills" data-for="add_blocked" aria-label="Suggestions to keep out">
+{{range .BlockPills}}<button type="button" aria-pressed="false">{{.}}</button>{{end}}
+</div>
+<button class="save" type="submit">Add</button>
+</form>
+<details class="rewrite"{{if .Rewriting}} open{{end}}>
+<summary>Rewrite or remove</summary>
+{{if and .Error .Rewriting}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+<form method="post" action="/__hider/onboard">
+<input type="hidden" name="action" value="rewrite">
+<label for="allowed">Let through</label>
+<textarea id="allowed" name="allowed" required>{{.Rewrite.Allowed}}</textarea>
+<label for="blocked">Keep out</label>
+<textarea id="blocked" name="blocked" required>{{.Rewrite.Blocked}}</textarea>
+{{if .Locked}}
+<label for="password">Unlock password</label>
+<p class="hint">From <code>sudo ythider reveal</code>, after the cool-off.</p>
+<input type="password" id="password" name="password" autocomplete="off" required>
+{{end}}
+<button class="save" type="submit">Save rewrite</button>
+</form>
+</details>
+{{else}}
 <h1>What do you come to YouTube for?</h1>
-<p>A model on this Mac checks every search against the two descriptions below. Write them the way you would explain it to a person. Naming specific people, channels and topics makes it more accurate.</p>
+<p>A model on this Mac checks every search, video and channel against the two descriptions below. Write them the way you would explain it to a person. Naming specific people, channels and topics makes it more accurate.</p>
 {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
 <form method="post" action="/__hider/onboard">
+<input type="hidden" name="action" value="rewrite">
 <label for="allowed">Let through</label>
 <p class="hint">What you want to be able to find.</p>
-<textarea id="allowed" name="allowed" required>{{.Policy.Allowed}}</textarea>
+<textarea id="allowed" name="allowed" required>{{.Rewrite.Allowed}}</textarea>
 <div class="pills" data-for="allowed" aria-label="Suggestions to let through">
 {{range .AllowPills}}<button type="button" aria-pressed="false">{{.}}</button>{{end}}
 </div>
 <label for="blocked">Keep out</label>
-<p class="hint">What you want kept away from you, even when you ask for it.</p>
-<textarea id="blocked" name="blocked" required>{{.Policy.Blocked}}</textarea>
+<p class="hint">What you want kept away from you, even when you ask for it. When something is in both, it is kept out.</p>
+<textarea id="blocked" name="blocked" required>{{.Rewrite.Blocked}}</textarea>
 <div class="pills" data-for="blocked" aria-label="Suggestions to keep out">
 {{range .BlockPills}}<button type="button" aria-pressed="false">{{.}}</button>{{end}}
 </div>
-{{if .Locked}}
-<label for="password">Unlock password</label>
-<p class="hint">Changing these descriptions needs the password from <code>ythider reveal</code>.</p>
-<input type="password" id="password" name="password" autocomplete="off" required>
-<button class="save" type="submit">Save changes</button>
-{{else}}
 <button class="save" type="submit">Save and lock</button>
-<p class="note">After you save, changing either description needs the unlock password.</p>
-{{end}}
+<p class="note">After you save, you can still add to either description. Removing anything needs the unlock password.</p>
 </form>
+{{end}}
 </main>
 <script>
-// A pill adds its text to the description above it, or takes it back out.
+// A pill adds its text to the field above it, or takes it back out.
 for (const group of document.querySelectorAll('.pills')) {
   const field = document.getElementById(group.dataset.for);
   const items = () => field.value.split(',').map((s) => s.trim()).filter(Boolean);

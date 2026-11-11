@@ -15,33 +15,57 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// fakeClassifier blocks any query containing "junk" and fails on "broken".
+// fakeClassifier blocks anything mentioning "junk" (unsure, so appealable)
+// or "banned" (certain), and fails on "broken".
 type fakeClassifier struct{}
 
-func (fakeClassifier) classify(_ context.Context, _ policy, q string) (verdict, error) {
+func (fakeClassifier) classify(_ context.Context, _ policy, subject string) (verdict, error) {
 	switch {
-	case strings.Contains(q, "broken"):
+	case strings.Contains(subject, "broken"):
 		return verdict{}, errors.New("model offline")
-	case strings.Contains(q, "junk"):
-		return verdict{Reason: "junk"}, nil
+	case strings.Contains(subject, "banned"):
+		return verdict{Reason: "named", Confidence: 100}, nil
+	case strings.Contains(subject, "junk"):
+		return verdict{Reason: "resembles junk", Confidence: 80}, nil
 	}
-	return verdict{Allow: true}, nil
+	return verdict{Allow: true, Confidence: 95}, nil
 }
 
-// upstream records what reached "YouTube" and answers with canned pages.
-type upstream struct{ paths []string }
+const plainPage = `<html><head><script nonce="N0nce">var ytInitialData = {"contents":{"twoColumnWatchNextResults":{"results":{"a":1},"secondaryResults":{"x":[1]},"autoplay":{"y":1}}}};</script></head><body></body></html>`
+
+func videoPage(id, title string) string {
+	return `<html><head><script nonce="N0nce">var ytInitialPlayerResponse = ` + playerJSON(id, title) + `;</script></head><body></body></html>`
+}
+
+func playerJSON(id, title string) string {
+	return `{"videoDetails":{"videoId":"` + id + `","title":"` + title + `","author":"Some Channel"},"microformat":{"playerMicroformatRenderer":{"category":"Education"}}}`
+}
+
+// upstream records what reached "YouTube" and answers with canned bodies.
+type upstream struct {
+	paths []string
+	html  string // GET responses; plainPage when empty
+	json  string // POST responses
+}
 
 func (u *upstream) RoundTrip(r *http.Request) (*http.Response, error) {
 	u.paths = append(u.paths, r.URL.Path)
-	body, ct := `{"ok":true}`, "application/json"
+	body, ct := u.json, "application/json"
+	if body == "" {
+		body = `{"ok":true}`
+	}
 	if r.Method == http.MethodGet {
-		ct = "text/html; charset=utf-8"
-		body = `<html><head><script nonce="N0nce">var ytInitialData = {"contents":{"twoColumnWatchNextResults":{"results":{"a":1},"secondaryResults":{"x":[1]},"autoplay":{"y":1}}}};</script></head><body></body></html>`
+		ct, body = "text/html; charset=utf-8", u.html
+		if body == "" {
+			body = plainPage
+		}
 	}
 	return &http.Response{
 		StatusCode: 200, Header: http.Header{"Content-Type": {ct}, "Alt-Svc": {`h3=":443"`}},
@@ -161,9 +185,9 @@ func TestWatchPageIsStripped(t *testing.T) {
 	s, _ := testServer(t, somePolicy)
 	w := do(s, "GET", "/watch?v=abc", "", nil)
 	body := w.Body.String()
-	for _, gone := range []string{`"secondaryResults":`, `"autoplay":`} {
+	for _, gone := range []string{`"x":[1]`, `"y":1`} {
 		if strings.Contains(body, gone) {
-			t.Errorf("watch page still carries %s", gone)
+			t.Errorf("watch page still carries recommendation data %s", gone)
 		}
 	}
 	if !strings.Contains(body, `"results":{"a":1}`) {
@@ -174,6 +198,137 @@ func TestWatchPageIsStripped(t *testing.T) {
 	}
 	if w.Header().Get("Alt-Svc") != "" {
 		t.Error("Alt-Svc was passed through")
+	}
+}
+
+// Inside a playlist the "next" data is the playlist's own, and is kept.
+func TestPlaylistKeepsItsQueue(t *testing.T) {
+	in := `{"twoColumnWatchNextResults":{"playlist":{"p":1},"autoplay":{"y":1},"secondaryResults":{"x":[1]}}}`
+	out := string(pruneJSON([]byte(in), pruneWatch))
+	if !strings.Contains(out, `"autoplay":{"y":1}`) || strings.Contains(out, `"x":[1]`) {
+		t.Fatalf("got %s", out)
+	}
+}
+
+func TestSuggestionsAndSideNavigationAreEmpty(t *testing.T) {
+	s, up := testServer(t, somePolicy)
+	if w := do(s, "GET", "/complete/search?q=mr", "", map[string]string{"Sec-Fetch-Mode": "cors"}); w.Code != http.StatusNoContent {
+		t.Errorf("suggestions: got %d, want 204", w.Code)
+	}
+	if w := do(s, "POST", "/youtubei/v1/guide", "{}", map[string]string{"Sec-Fetch-Mode": "same-origin"}); w.Body.String() != `{"items":[]}` {
+		t.Errorf("side navigation: got %s", w.Body.String())
+	}
+	if len(up.paths) != 0 {
+		t.Fatalf("reached YouTube: %v", up.paths)
+	}
+}
+
+func TestEveryRouteToAVideoIsJudged(t *testing.T) {
+	s, up := testServer(t, somePolicy)
+	api := map[string]string{"Sec-Fetch-Mode": "same-origin"}
+
+	// A direct link.
+	up.html = videoPage("vid1", "pure junk")
+	w := do(s, "GET", "/watch?v=vid1", "", nil)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "pure junk") {
+		t.Fatalf("direct link to a blocked video: %d", w.Code)
+	}
+	// The same video again is refused without asking YouTube.
+	before := len(up.paths)
+	if w := do(s, "GET", "/watch?v=vid1", "", nil); w.Code != http.StatusForbidden || len(up.paths) != before {
+		t.Fatalf("remembered block: %d, upstream calls %d -> %d", w.Code, before, len(up.paths))
+	}
+	// A click inside the page: refused, and pointed at the page that says why.
+	up.json = `[` + playerJSON("vid2", "more junk") + `]`
+	w = do(s, "POST", "/youtubei/v1/get_watch", "{}", api)
+	if w.Code != http.StatusForbidden || w.Header().Get(gotoHeader) != "/watch?v=vid2" {
+		t.Fatalf("in-page navigation: %d goto=%q", w.Code, w.Header().Get(gotoHeader))
+	}
+	// Player data alone (embeds, previews): refused, but the page stays put.
+	w = do(s, "POST", "/youtubei/v1/player", "{}", api)
+	if w.Code != http.StatusForbidden || w.Header().Get(gotoHeader) != "" {
+		t.Fatalf("player request: %d goto=%q", w.Code, w.Header().Get(gotoHeader))
+	}
+	// An allowed video passes through byte for byte.
+	up.json = playerJSON("vid3", "a lecture")
+	if w := do(s, "POST", "/youtubei/v1/player", "{}", api); w.Code != 200 || w.Body.String() != up.json {
+		t.Fatalf("allowed player response was altered: %d %s", w.Code, w.Body.String())
+	}
+	// Video data that cannot be read is not shown.
+	up.html = `<html><head></head><body><script>var other = {"videoDetails":{"title":"x"}};</script></body></html>`
+	if w := do(s, "GET", "/watch?v=vid4", "", nil); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unreadable video data: got %d, want 503", w.Code)
+	}
+}
+
+func TestChannelsAndPlaylistsAreJudged(t *testing.T) {
+	s, up := testServer(t, somePolicy)
+	up.html = `<html><head><script>var ytInitialData = {"metadata":{"channelMetadataRenderer":{"title":"junk central","description":"daily","externalId":"UC123"}}};</script></head></html>`
+	if w := do(s, "GET", "/@junkcentral", "", nil); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "junk central") {
+		t.Fatalf("blocked channel page: %d", w.Code)
+	}
+	up.json = `{"metadata":{"playlistMetadataRenderer":{"title":"banned mix"}}}`
+	w := do(s, "POST", "/youtubei/v1/browse", `{"browseId":"VLPL999"}`, map[string]string{"Sec-Fetch-Mode": "same-origin"})
+	if w.Code != http.StatusForbidden || w.Header().Get(gotoHeader) != "/playlist?list=PL999" {
+		t.Fatalf("in-page playlist: %d goto=%q", w.Code, w.Header().Get(gotoHeader))
+	}
+}
+
+var tokenRe = regexp.MustCompile(`name="token" value="([0-9a-f]+)"`)
+
+func TestAppeal(t *testing.T) {
+	s, _ := testServer(t, somePolicy)
+	post := func(token, why string) *httptest.ResponseRecorder {
+		body := url.Values{"token": {token}, "why": {why}}.Encode()
+		return do(s, "POST", "/__hider/appeal", body, map[string]string{
+			"Content-Type": "application/x-www-form-urlencoded", "Sec-Fetch-Site": "same-origin",
+		})
+	}
+
+	// A block the model is certain of offers no appeal.
+	if w := do(s, "GET", "/results?search_query=banned+thing", "", nil); tokenRe.MatchString(w.Body.String()) {
+		t.Fatal("a certain block offered an appeal")
+	}
+	// One it is unsure of does.
+	w := do(s, "GET", "/results?search_query=junk+history", "", nil)
+	m := tokenRe.FindStringSubmatch(w.Body.String())
+	if w.Code != http.StatusForbidden || m == nil {
+		t.Fatalf("unsure block: %d, appeal offered: %v", w.Code, m != nil)
+	}
+	token := m[1]
+
+	if w := post(token, "because"); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "at least 250") {
+		t.Fatalf("short appeal: %d", w.Code)
+	}
+	if w := post(token, strings.Repeat("a", 300)); w.Code != http.StatusForbidden {
+		t.Fatalf("300 characters of nothing was accepted: %d", w.Code)
+	}
+	if w := do(s, "GET", "/results?search_query=junk+history", "", nil); w.Code != http.StatusForbidden {
+		t.Fatal("a rejected appeal opened the search")
+	}
+
+	var words []string
+	for i := range 60 {
+		words = append(words, "reason"+strconv.Itoa(i))
+	}
+	w = post(token, strings.Join(words, " "))
+	if w.Code != http.StatusSeeOther || !strings.HasSuffix(w.Header().Get("Location"), "/results?search_query=junk+history") {
+		t.Fatalf("good appeal: %d -> %q", w.Code, w.Header().Get("Location"))
+	}
+	if w := do(s, "GET", "/results?search_query=junk+history", "", nil); w.Code != 200 {
+		t.Fatalf("after appeal: %d", w.Code)
+	}
+	// The grant and its text survive a restart.
+	restarted := newServer(s.store, fakeClassifier{}, &upstream{})
+	if w := do(restarted, "GET", "/results?search_query=junk+history", "", nil); w.Code != 200 {
+		t.Fatalf("after restart: %d", w.Code)
+	}
+	if g := restarted.grants["search:junk history"]; !strings.HasPrefix(g.Why, "reason0 ") {
+		t.Fatalf("appeal text was not kept: %+v", g)
+	}
+	// A token cannot be forged for something certain.
+	if w := post("deadbeef", strings.Join(words, " ")); w.Code != http.StatusSeeOther || do(s, "GET", "/results?search_query=banned+thing", "", nil).Code != http.StatusForbidden {
+		t.Fatalf("unknown token: %d", w.Code)
 	}
 }
 
@@ -188,15 +343,17 @@ func TestUnconfiguredSendsEverythingToOnboarding(t *testing.T) {
 	}
 }
 
-func TestPolicyChangesNeedThePassword(t *testing.T) {
+func TestAddingIsOpenRemovingNeedsThePassword(t *testing.T) {
 	s, _ := testServer(t, policy{})
-	form := func(allowed, password string) *httptest.ResponseRecorder {
-		body := url.Values{"allowed": {allowed}, "blocked": {"junk"}, "password": {password}}.Encode()
-		return do(s, "POST", "/__hider/onboard", body, map[string]string{
+	form := func(v url.Values) *httptest.ResponseRecorder {
+		return do(s, "POST", "/__hider/onboard", v.Encode(), map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded", "Sec-Fetch-Site": "same-origin",
 		})
 	}
-	if w := form("first", ""); w.Code != http.StatusSeeOther || s.currentPolicy().Allowed != "first" {
+	rewrite := func(allowed, password string) *httptest.ResponseRecorder {
+		return form(url.Values{"action": {"rewrite"}, "allowed": {allowed}, "blocked": {"junk"}, "password": {password}})
+	}
+	if w := rewrite("first", ""); w.Code != http.StatusSeeOther || s.currentPolicy().Allowed != "first" {
 		t.Fatalf("first save: %d", w.Code)
 	}
 	lk, err := newLock("abcd-efgh-ijkl-mnop", time.Hour, false)
@@ -206,13 +363,25 @@ func TestPolicyChangesNeedThePassword(t *testing.T) {
 	if err := s.store.write("lock.json", lk); err != nil {
 		t.Fatal(err)
 	}
-	if w := form("everything", "wrong"); w.Code != http.StatusBadRequest || s.currentPolicy().Allowed != "first" {
-		t.Fatalf("wrong password changed the policy: %d %q", w.Code, s.currentPolicy().Allowed)
+
+	// Adding needs no password and loses nothing.
+	if w := form(url.Values{"add_allowed": {"talks"}, "add_blocked": {"vlogs"}}); w.Code != http.StatusSeeOther {
+		t.Fatalf("add: %d", w.Code)
 	}
-	if w := form("second", "ABCD efgh-ijkl-mnop"); w.Code != http.StatusSeeOther || s.currentPolicy().Allowed != "second" {
+	if p := s.currentPolicy(); p.Allowed != "first\ntalks" || p.Blocked != "junk\nvlogs" {
+		t.Fatalf("after add: %+v", p)
+	}
+	// A form that tries to replace the text without the rewrite action only adds nothing.
+	if w := form(url.Values{"allowed": {"everything"}, "blocked": {"nothing"}}); w.Code != http.StatusBadRequest || s.currentPolicy().Allowed != "first\ntalks" {
+		t.Fatalf("replacement without password: %d %+v", w.Code, s.currentPolicy())
+	}
+	if w := rewrite("everything", "wrong"); w.Code != http.StatusBadRequest || s.currentPolicy().Allowed != "first\ntalks" {
+		t.Fatalf("wrong password rewrote the policy: %d", w.Code)
+	}
+	if w := rewrite("second", "ABCD efgh-ijkl-mnop"); w.Code != http.StatusSeeOther || s.currentPolicy().Allowed != "second" {
 		t.Fatalf("right password: %d", w.Code)
 	}
-	cross := do(s, "POST", "/__hider/onboard", "allowed=x&blocked=y", map[string]string{
+	cross := do(s, "POST", "/__hider/onboard", "add_allowed=x", map[string]string{
 		"Content-Type": "application/x-www-form-urlencoded", "Sec-Fetch-Site": "cross-site",
 	})
 	if cross.Code != http.StatusForbidden {

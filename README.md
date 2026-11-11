@@ -1,16 +1,20 @@
 # youtube-hider
 
-YouTube as a search bar. No home feed, no Shorts, no "up next", and every
-search is checked by a model running on your Mac against what you said you
-come to YouTube for.
+YouTube as a search bar. No home feed, no Shorts, no "up next", no
+suggestions, and everything you open is checked by a model running on your Mac
+against what you said you come to YouTube for.
 
 - **Home** is a single search box. Nothing else loads.
 - **Search results** show results. Shorts shelves, "people also watched"
-  shelves and ads are removed.
-- **Watch pages** play the video. The recommendation column, the end-of-video
-  wall and autoplay are removed.
-- **Each search** is classified by a local model in about 200 ms. A search
-  that doesn't fit gets a "Not approved" page instead of results.
+  shelves, ads and search suggestions are removed.
+- **Watch pages** are the video, its title, the channel's name and the
+  description. The recommendation column, end-of-video wall, autoplay,
+  comments, avatar, subscriber count and subscribe button are removed, and
+  the video takes the width they leave behind.
+- **Every search, video, channel and playlist** is classified by a local
+  model in about a quarter of a second, whether you searched for it, clicked
+  it, or followed a link from somewhere else. What doesn't fit gets a
+  "Not approved" page with the model's reason and how sure it was.
 - **Turning it off** needs a password that was generated for you and never
   shown.
 
@@ -66,10 +70,46 @@ sudo ./ythider install
 macOS asks once to approve trusting the certificate. Then quit and reopen
 your browser and go to youtube.com: the first visit is the onboarding page.
 Write your two descriptions (the suggestion pills are prompts, not defaults)
-and save. From then on, changing them needs the password.
+and save.
 
 `--model NAME` picks a different Ollama model. If Ollama isn't running or the
-model isn't pulled, searches are blocked until it is.
+model isn't pulled, everything is blocked until it is.
+
+To move an installed copy to a newer build, with the policy and lock left as
+they are:
+
+```sh
+git pull && go build -o ythider . && sudo ./ythider upgrade
+```
+
+## Changing what belongs
+
+The policy page is at `https://www.youtube.com/__hider/onboard`, and linked
+from every "Not approved" page.
+
+- **Adding** to either description is always open. No password.
+- **Rewriting or removing** needs the unlock password.
+- **When something is in both** descriptions, it is kept out. Adding
+  "tech reviews" to what's let through does not undo having it in what's
+  kept out.
+
+## Appeals
+
+Each verdict comes with a confidence from 0 to 100. A block under 95 can be
+appealed from the page that reports it: write at least 250 characters on why
+you want it and what you are looking for, and it opens. A block the model is
+sure of, because your description names the thing, has no appeal.
+
+An accepted appeal covers that one search, video, channel or playlist from
+then on. The text is kept in `appeals.json` next to the policy, so what you
+let through and why can be read back later.
+
+The confidence is the model's own report, steered by a rubric: 100 only when
+a description names the subject or it is squarely one of the listed kinds,
+60 to 85 for inference by resemblance. Left unsteered, the model answers 95
+to 100 for everything, and the probability of its verdict token is no better.
+The rubric is what makes the number separate "you named this" from "this
+resembles something you named".
 
 ## Getting out
 
@@ -98,14 +138,18 @@ entries are there so that getting around it takes deliberate work.
 Also out of scope:
 
 - Other devices, and the YouTube apps on them.
-- A video opened by direct link. Only searches are classified.
-- Channel pages, playlists and history, which still load.
-- YouTube Music and embedded players on other sites. Embeds play, with the
-  end-of-video suggestions hidden.
+- Your own history, playlists list and library pages, which load unjudged.
+  The videos in them are judged when opened.
+- The like, share and save buttons under a video, which stay.
+- YouTube Music.
 - A browser set up to resolve names somewhere else (a remote proxy or VPN
   that does its own DNS). iCloud Private Relay in Safari has not been tested.
 - Firefox, which keeps its own certificate store. YouTube won't load there
   unless `security.enterprise_roots.enabled` is turned on.
+
+A video is judged from its title, channel and category, not its contents. A
+lecture with a clickbait title can be blocked, and junk with a sober title
+can pass.
 
 ## Measuring the classifier
 
@@ -115,13 +159,15 @@ A policy is a hypothesis about what the model will do with it. Test it:
 ythider eval --policy policy.json queries.tsv
 ```
 
-`policy.json` is `{"allowed": "...", "blocked": "..."}` and `queries.tsv` has
-one labeled query per line, `allow<TAB>query` or `block<TAB>query`. The output
-lists every disagreement with the model's reason, then agreement and latency.
-Use `--model` to compare models on the same file.
+`policy.json` is `{"allowed": "...", "blocked": "..."}`. `queries.tsv` has one
+labeled line per item: `allow<TAB>query` or `block<TAB>query` for a search,
+and `allow<TAB>title<TAB>channel<TAB>category` for a video. The output lists
+every disagreement with the model's confidence and reason, then agreement,
+how many wrong blocks could have been appealed, and latency. Use `--model` to
+compare models on the same file.
 
-On an M5 Pro, `gemma4:e4b` answers in about 200 ms once loaded and about 3 s
-for the first search after 30 idle minutes. It holds roughly 10 GB of memory
+On an M5 Pro, `gemma4:e4b` answers in about 250 ms once loaded and about 3 s
+for the first request after 30 idle minutes. It holds roughly 10 GB of memory
 while loaded.
 
 ## Development

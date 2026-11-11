@@ -3,22 +3,64 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{if .Error}}Can't check this search{{else}}Not approved{{end}}</title>
+<title>{{if .Error}}Can't check this{{else}}Not approved{{end}}</title>
 {{template "style"}}
+<style>
+.what{color:var(--fg)}
+.appeal{margin-top:36px;padding-top:24px;border-top:1px solid var(--line)}
+.appeal summary{cursor:pointer;font-weight:600;width:fit-content}
+.appeal label{display:block;margin:16px 0 8px;color:var(--muted)}
+.appeal textarea{min-height:160px}
+.row{display:flex;align-items:center;gap:16px;margin-top:12px}
+.row button{height:40px;padding:0 20px;border-radius:20px;border:0;background:var(--accent);color:var(--on-accent);font-weight:600}
+.row button:disabled{opacity:.35;cursor:default}
+.count{font-size:14px;color:var(--muted);font-variant-numeric:tabular-nums}
+.links{margin-top:28px;font-size:14px}
+.links a{color:var(--muted)}
+</style>
 </head>
 <body>
 <main class="center">
 {{if .Error}}
-<h1>Can't check this search</h1>
-<p>The local model didn't answer, so the search stays blocked. Check that Ollama is running and the model is pulled, then search again.</p>
+<h1>Can't check this</h1>
+<p>It couldn't be checked against what you wrote, so it stays blocked. Check that Ollama is running and the model is pulled, then try again.</p>
 <p class="error">{{.Error}}</p>
 {{else}}
 <h1>Not approved</h1>
-<p>{{if .Reason}}{{.Reason}}{{else}}This search doesn't fit what you said you come here for.{{end}}</p>
+{{if ne .Kind "search"}}<p class="what">{{.Title}}{{if .Channel}} · {{.Channel}}{{end}}</p>{{end}}
+<p>{{if .Reason}}{{.Reason}}{{else}}This doesn't fit what you said you come here for.{{end}} <span class="count">{{.Confidence}}% sure.</span></p>
 {{end}}
 <form action="/results" method="get" role="search">
-<input type="search" name="search_query" aria-label="Search" placeholder="Search" autocomplete="off" value="{{.Query}}" required>
+<input type="search" name="search_query" aria-label="Search" placeholder="Search" autocomplete="off" value="{{if eq .Kind "search"}}{{.Title}}{{end}}" required>
 </form>
+{{if .Token}}
+<details class="appeal"{{if .AppealError}} open{{end}}>
+<summary>Appeal</summary>
+<form method="post" action="/__hider/appeal">
+<input type="hidden" name="token" value="{{.Token}}">
+<label for="why">The model wasn't sure about this one. Write why you want it and what you are looking for. It opens after {{.MinChars}} characters, and what you write is kept.</label>
+{{if .AppealError}}<p class="error" role="alert">{{.AppealError}}</p>{{end}}
+<textarea id="why" name="why" minlength="{{.MinChars}}" required>{{.Why}}</textarea>
+<div class="row"><button type="submit" disabled>Submit appeal</button><span class="count" aria-live="polite"></span></div>
+</form>
+</details>
+<script>
+(() => {
+  const min = {{.MinChars}};
+  const field = document.getElementById('why');
+  const button = field.form.querySelector('button');
+  const count = field.form.querySelector('.count');
+  const update = () => {
+    const n = [...field.value.trim()].length;
+    button.disabled = n < min;
+    count.textContent = n < min ? (min - n) + ' more characters' : n + ' characters';
+  };
+  field.addEventListener('input', update);
+  update();
+})();
+</script>
+{{end}}
+<p class="links"><a href="/__hider/onboard">Add to what's let through or kept out</a></p>
 </main>
 </body>
 </html>

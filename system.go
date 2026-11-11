@@ -111,13 +111,17 @@ func requireRoot() error {
 	return nil
 }
 
+// copyFile writes dst as a new file and renames it into place. macOS ties a
+// running binary's code signature to its file, so the daemon's binary must
+// be replaced, never overwritten.
 func copyFile(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	tmp := dst + ".new"
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
@@ -125,7 +129,29 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
+// upgrade swaps the running daemon's binary for this one and restarts it.
+// The policy, the lock and the certificate authority are left as they are.
+func upgrade(st *store) error {
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	if _, err := os.Stat(st.path("lock.json")); err != nil {
+		return errors.New("not installed; run `sudo ythider install`")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if err := copyFile(self, st.path(filepath.Join("bin", "ythider")), 0o755); err != nil {
+		return err
+	}
+	return run("launchctl", "kickstart", "-k", "system/"+daemonLabel)
 }
 
 func plistXML(binary string) string {

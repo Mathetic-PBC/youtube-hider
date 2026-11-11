@@ -16,9 +16,27 @@ ytd-guide-renderer,
 ytd-mini-guide-renderer,
 ytd-notification-topbar-button-renderer,
 
-/* Watch page: the "up next" column. */
+/* Search box: the dropdown of suggested and past searches. */
+.ytSearchboxComponentSuggestionsContainer,
+yt-searchbox [role="listbox"],
+
+/* Watch page: the "up next" column, comments, and everything around the
+   channel's name (avatar, subscriber count, subscribe and join buttons). */
 #related,
 ytd-watch-next-secondary-results-renderer,
+ytd-comments,
+ytd-video-owner-renderer > a,
+ytd-video-owner-renderer #owner-sub-count,
+ytd-video-owner-renderer #sponsor-button,
+ytd-video-owner-renderer #purchase-button,
+ytd-video-owner-renderer #analytics-button,
+ytd-watch-metadata #subscribe-button,
+ytd-merch-shelf-renderer,
+
+/* With nothing left in it, the side column gives its width to the video.
+   It stays when it holds a playlist, live chat, or an open panel such as
+   the transcript. */
+ytd-watch-flexy #secondary:not(:has(ytd-playlist-panel-renderer:not([hidden]), ytd-live-chat-frame, ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"])),
 
 /* Player: end-of-video wall, autoplay countdown, pause-screen suggestions. */
 .html5-endscreen,
