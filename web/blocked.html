@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{if .Error}}Can't check this search{{else}}Not approved{{end}}</title>
+{{template "style"}}
+</head>
+<body>
+<main class="center">
+{{if .Error}}
+<h1>Can't check this search</h1>
+<p>The local model didn't answer, so the search stays blocked. Check that Ollama is running and the model is pulled, then search again.</p>
+<p class="error">{{.Error}}</p>
+{{else}}
+<h1>Not approved</h1>
+<p>{{if .Reason}}{{.Reason}}{{else}}This search doesn't fit what you said you come here for.{{end}}</p>
+{{end}}
+<form action="/results" method="get" role="search">
+<input type="search" name="search_query" aria-label="Search" placeholder="Search" autocomplete="off" value="{{.Query}}" required>
+</form>
+</main>
+</body>
+</html>

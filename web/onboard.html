@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Set up YouTube</title>
+{{template "style"}}
+<style>
+main{padding:56px 0 72px}
+label{display:block;font-weight:600;margin:28px 0 2px}
+.hint{font-size:14px;margin:0 0 10px}
+.pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.pills button{height:32px;padding:0 12px;border-radius:16px;border:1px solid var(--line);background:transparent;color:var(--fg);font-size:14px}
+.pills button:hover{border-color:var(--fg)}
+.pills button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.save{margin-top:32px;height:44px;padding:0 22px;border-radius:22px;border:0;background:var(--accent);color:var(--on-accent);font-weight:600}
+.note{font-size:14px;margin:14px 0 0}
+</style>
+</head>
+<body>
+<main>
+<h1>What do you come to YouTube for?</h1>
+<p>A model on this Mac checks every search against the two descriptions below. Write them the way you would explain it to a person. Naming specific people, channels and topics makes it more accurate.</p>
+{{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+<form method="post" action="/__hider/onboard">
+<label for="allowed">Let through</label>
+<p class="hint">What you want to be able to find.</p>
+<textarea id="allowed" name="allowed" required>{{.Policy.Allowed}}</textarea>
+<div class="pills" data-for="allowed" aria-label="Suggestions to let through">
+{{range .AllowPills}}<button type="button" aria-pressed="false">{{.}}</button>{{end}}
+</div>
+<label for="blocked">Keep out</label>
+<p class="hint">What you want kept away from you, even when you ask for it.</p>
+<textarea id="blocked" name="blocked" required>{{.Policy.Blocked}}</textarea>
+<div class="pills" data-for="blocked" aria-label="Suggestions to keep out">
+{{range .BlockPills}}<button type="button" aria-pressed="false">{{.}}</button>{{end}}
+</div>
+{{if .Locked}}
+<label for="password">Unlock password</label>
+<p class="hint">Changing these descriptions needs the password from <code>ythider reveal</code>.</p>
+<input type="password" id="password" name="password" autocomplete="off" required>
+<button class="save" type="submit">Save changes</button>
+{{else}}
+<button class="save" type="submit">Save and lock</button>
+<p class="note">After you save, changing either description needs the unlock password.</p>
+{{end}}
+</form>
+</main>
+<script>
+// A pill adds its text to the description above it, or takes it back out.
+for (const group of document.querySelectorAll('.pills')) {
+  const field = document.getElementById(group.dataset.for);
+  const items = () => field.value.split(',').map((s) => s.trim()).filter(Boolean);
+  const sync = () => {
+    const have = new Set(items().map((s) => s.toLowerCase()));
+    for (const b of group.children) b.setAttribute('aria-pressed', have.has(b.textContent.toLowerCase()));
+  };
+  group.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    const text = b.textContent;
+    const rest = items().filter((s) => s.toLowerCase() !== text.toLowerCase());
+    if (b.getAttribute('aria-pressed') !== 'true') rest.push(text);
+    field.value = rest.join(', ');
+    sync();
+  });
+  field.addEventListener('input', sync);
+  sync();
+}
+</script>
+</body>
+</html>
