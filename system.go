@@ -148,26 +148,13 @@ func upgrade(st *store) error {
 	if err != nil {
 		return err
 	}
+	if _, sealed := sealedLock(st); sealed {
+		return arm(st)
+	}
 	if err := copyFile(self, st.path(filepath.Join("bin", "ythider")), 0o755); err != nil {
 		return err
 	}
 	return run("launchctl", "kickstart", "-k", "system/"+daemonLabel)
-}
-
-func plistXML(binary string) string {
-	return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key><string>` + daemonLabel + `</string>
-	<key>ProgramArguments</key>
-	<array><string>` + binary + `</string><string>serve</string></array>
-	<key>RunAtLoad</key><true/>
-	<key>KeepAlive</key><true/>
-	<key>StandardErrorPath</key><string>/Library/Logs/youtube-hider.log</string>
-</dict>
-</plist>
-`
 }
 
 // install sets up the daemon, the constrained certificate authority and the
@@ -193,8 +180,8 @@ func install(st *store, cfg config, cooloff time.Duration, never bool) error {
 	if err := os.MkdirAll(st.path("bin"), 0o700); err != nil {
 		return err
 	}
-	binary := st.path(filepath.Join("bin", "ythider"))
-	if err := copyFile(self, binary, 0o755); err != nil {
+	proxy, _ := services(st)
+	if err := copyFile(self, proxy.binary, 0o755); err != nil {
 		return err
 	}
 	if err := st.write("config.json", cfg); err != nil {
@@ -215,7 +202,7 @@ func install(st *store, cfg config, cooloff time.Duration, never bool) error {
 	if err := st.write("lock.json", lk); err != nil {
 		return err
 	}
-	if err := os.WriteFile(daemonPlist, []byte(plistXML(binary)), 0o644); err != nil {
+	if err := os.WriteFile(daemonPlist, []byte(proxy.xml()), 0o644); err != nil {
 		return err
 	}
 	return run("launchctl", "bootstrap", "system", daemonPlist)

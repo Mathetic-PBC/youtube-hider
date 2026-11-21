@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -77,8 +79,9 @@ type ollamaClassifier struct {
 	model    string
 	client   *http.Client
 
-	mu    sync.Mutex
-	cache map[[32]byte]verdict
+	mu     sync.Mutex
+	cache  map[[32]byte]verdict
+	probed time.Time // when the model last passed its self-check
 }
 
 func newOllamaClassifier(c config) *ollamaClassifier {
@@ -113,6 +116,44 @@ type chatMessage struct {
 	Content string `json:"content"`
 }
 
+// The self-check asks the model about something that a fixed policy plainly
+// rules out. A model that lets it through is not judging anything, whatever
+// the reason, and every verdict from it is refused until it passes again.
+var (
+	probePolicy = policy{
+		Allowed: "University lectures on mathematics and physics.",
+		Blocked: "Celebrity gossip, prank videos, reaction videos.",
+	}
+	probes = []string{
+		"celebrity gossip this week",
+		"funniest prank videos compilation",
+		"reaction video to movie trailer",
+		"celebrity breakup drama explained",
+	}
+)
+
+const probeEvery = 2 * time.Minute
+
+func (o *ollamaClassifier) selfCheck(ctx context.Context) error {
+	o.mu.Lock()
+	fresh := time.Since(o.probed) < probeEvery
+	o.mu.Unlock()
+	if fresh {
+		return nil
+	}
+	v, err := o.ask(ctx, probePolicy, searchItem(probes[rand.IntN(len(probes))]).subject())
+	if err != nil {
+		return err
+	}
+	if v.Allow {
+		return errors.New("the local model failed its self-check: it let through something it has to block")
+	}
+	o.mu.Lock()
+	o.probed = time.Now()
+	o.mu.Unlock()
+	return nil
+}
+
 func (o *ollamaClassifier) classify(ctx context.Context, p policy, subject string) (verdict, error) {
 	key := sha256.Sum256([]byte(p.Allowed + "\x00" + p.Blocked + "\x00" + o.model + "\x00" + subject))
 	o.mu.Lock()
@@ -121,7 +162,24 @@ func (o *ollamaClassifier) classify(ctx context.Context, p policy, subject strin
 	if ok {
 		return v, nil
 	}
+	if err := o.selfCheck(ctx); err != nil {
+		return verdict{}, err
+	}
+	v, err := o.ask(ctx, p, subject)
+	if err != nil {
+		return verdict{}, err
+	}
+	o.mu.Lock()
+	if len(o.cache) > 5000 {
+		clear(o.cache)
+	}
+	o.cache[key] = v
+	o.mu.Unlock()
+	return v, nil
+}
 
+// ask puts one subject to the model, with no cache and no self-check.
+func (o *ollamaClassifier) ask(ctx context.Context, p policy, subject string) (verdict, error) {
 	body, err := json.Marshal(map[string]any{
 		"model":      o.model,
 		"stream":     false,
@@ -169,13 +227,5 @@ func (o *ollamaClassifier) classify(ctx context.Context, p policy, subject strin
 		return verdict{}, fmt.Errorf("local model returned malformed output: %q", out.Message.Content)
 	}
 	// Anything that is not an explicit allow is a block.
-	v = verdict{Allow: parsed.Verdict == "allow", Reason: parsed.Reason, Confidence: min(max(parsed.Confidence, 0), 100)}
-
-	o.mu.Lock()
-	if len(o.cache) > 5000 {
-		clear(o.cache)
-	}
-	o.cache[key] = v
-	o.mu.Unlock()
-	return v, nil
+	return verdict{Allow: parsed.Verdict == "allow", Reason: parsed.Reason, Confidence: min(max(parsed.Confidence, 0), 100)}, nil
 }

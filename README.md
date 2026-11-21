@@ -18,7 +18,8 @@ against what you said you come to YouTube for.
 - **Ads** are removed: the schedule that tells the player which ads to play
   is deleted before the page sees it, so there is nothing to skip.
 - **Turning it off** needs a password that was generated for you and never
-  shown.
+  shown. Sealing throws the password away and makes the installation put
+  itself back when parts of it are removed.
 
 The repository ships no policy. On first run you write two descriptions, what
 to let through and what to keep out, and the model reads exactly those.
@@ -90,7 +91,8 @@ The policy page is at `https://www.youtube.com/__hider/onboard`, and linked
 from every "Not approved" page.
 
 - **Adding** to either description is always open. No password.
-- **Rewriting or removing** needs the unlock password.
+- **Rewriting or removing** needs the unlock password, and is impossible
+  once sealed.
 - **When something is in both** descriptions, it is kept out. Adding
   "tech reviews" to what's let through does not undo having it in what's
   kept out.
@@ -153,17 +155,36 @@ sudo ythider relock           # after a reveal: new password, not shown
 `--cooloff never` keeps no copy of the password at all, so there is nothing
 to reveal.
 
-`sudo ythider seal` does the same to a copy that is already installed: it
-replaces the password with a new one and keeps no copy. After that none of
-the commands above can open the lock, the policy can only be added to, and
-there is no undoing it.
+### Sealing
+
+`sudo ythider seal` is for when you want no way out. It cannot be undone.
+
+- **No password.** The password is replaced with a new one and no copy is
+  kept, so none of the commands above can ever open the lock.
+- **The policy only grows.** You can still add to either description and
+  appeal a block. Nothing can be rewritten or removed, on the policy page or
+  by editing the file behind it.
+- **It defends itself.** A second root daemon, the warden, starts. The proxy
+  and the warden each put back the other's program and launchd entry and
+  start the other again if it is stopped. Both keep the hosts entries, the
+  lock and the machine setup as they were. The files carry the system
+  immutable flag.
+- **Upgrades still work.** `sudo ./ythider upgrade` replaces both daemons
+  with the new build, so fixes can be deployed. That is the only change a
+  sealed installation accepts.
+
+Do not seal a copy you are only trying out. A sealed installation has no
+uninstall command, and this README does not describe removing one by hand.
 
 ## What it does not stop
 
 This raises the cost of an impulse. It is not a hard lock against the
-machine's administrator, and can't be: anyone with `sudo` can unload the
-daemon by hand. The password, the cool-off and the self-restoring hosts
-entries are there so that getting around it takes deliberate work.
+machine's administrator, and no program can be: whoever holds root on a
+machine can undo anything root installed on it. Sealing makes that a piece
+of deliberate work with several parts that have to be done right at once. If
+you need more than that, the person at the keyboard must not be an
+administrator: use a standard account day to day and have someone else hold
+the admin password.
 
 Also out of scope:
 
@@ -172,8 +193,6 @@ Also out of scope:
   The videos in them are judged when opened.
 - The like, share and save buttons under a video, which stay.
 - YouTube Music.
-- A browser set up to resolve names somewhere else (a remote proxy or VPN
-  that does its own DNS). iCloud Private Relay in Safari has not been tested.
 - Firefox, which keeps its own certificate store. YouTube won't load there
   unless `security.enterprise_roots.enabled` is turned on.
 
@@ -223,8 +242,10 @@ YouTube changes its page structure often. The proxy-side removal lives in
 ## Status
 
 Developed and checked against live YouTube in Chrome on macOS 27 using the
-development mode above. The privileged install path is new; read
-`system.go` before running it.
+development mode above. The privileged paths (install, upgrade, seal and
+the guard) cannot be exercised by the test suite, which covers their logic
+against temporary directories; read `system.go` and `guard.go` before
+running them.
 
 ## License
 

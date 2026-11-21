@@ -32,7 +32,8 @@ const usage = `ythider: YouTube as a search bar, gated by a local model.
   sudo ythider reveal             show the password once the cool-off has passed
   sudo ythider unlock             remove everything (asks for the password)
   sudo ythider relock             replace a revealed password with a new unknown one
-  sudo ythider seal               give up the way out: new password, no copy kept
+  sudo ythider seal               give up the way out for good: no password is kept,
+                                  and the installation starts defending itself
        ythider eval --policy FILE QUERIES.tsv   measure the classifier on labeled queries
        ythider serve --dev --state DIR --listen ADDR   run unprivileged for development
 `
@@ -53,6 +54,7 @@ func main() {
 		"unlock":         cmdUnlock,
 		"relock":         cmdRelock,
 		"seal":           cmdSeal,
+		"guard":          cmdGuard,
 		"eval":           cmdEval,
 	}
 	cmd, ok := cmds[os.Args[1]]
@@ -88,10 +90,18 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	srv := newServer(st, newOllamaClassifier(st.config()), upstreamTransport(newResolver()))
 	if !*dev {
 		go guardHosts()
+		if raw, sealed := sealedLock(st); sealed {
+			proxy, warden := services(st)
+			g, err := newGuardian(st, proxy, warden, raw)
+			if err != nil {
+				return err
+			}
+			go g.run()
+		}
 	}
+	srv := newServer(st, newOllamaClassifier(st.config()), upstreamTransport(newResolver()))
 	go srv.warm()
 	log.Printf("youtube-hider serving on %s", *listen)
 	return srv.listenAndServe(strings.Split(*listen, ","), ca)
@@ -202,6 +212,11 @@ func cmdStatus([]string) error {
 	switch left, err := lk.remaining(time.Now()); {
 	case lk.Cooloff < 0:
 		fmt.Println("unlock:    sealed; no copy of the password exists")
+		if run("launchctl", "print", "system/"+wardenLabel) == nil {
+			fmt.Println("guard:     running")
+		} else {
+			fmt.Println("guard:     not loaded; `sudo ythider seal` starts it")
+		}
 	case err != nil:
 		fmt.Printf("unlock:    locked; cool-off is %s once requested\n", time.Duration(lk.Cooloff)*time.Second)
 	case left > 0:
@@ -309,27 +324,56 @@ func cmdRelock([]string) error {
 	return nil
 }
 
+// cmdGuard is the warden: the second daemon of a sealed installation. It
+// serves nothing; it keeps the proxy installed, loaded and pointed at.
+func cmdGuard([]string) error {
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	st := &store{dir: defaultStateDir}
+	raw, sealed := sealedLock(st)
+	if !sealed {
+		return errors.New("guard runs only for a sealed installation")
+	}
+	proxy, warden := services(st)
+	g, err := newGuardian(st, warden, proxy, raw)
+	if err != nil {
+		return err
+	}
+	go guardHosts()
+	log.Printf("youtube-hider guard watching %s", proxy.label)
+	g.run()
+	return nil
+}
+
 // cmdSeal replaces the password with a new one and keeps no copy, so the
-// lock can no longer be opened through this program. It only ever tightens,
-// which is why it does not ask for the current password.
+// lock can no longer be opened through this program, and arms the guard. It
+// only ever tightens, which is why it does not ask for the current password.
+// Run again on a sealed installation, it re-arms the guard and changes
+// nothing else.
 func cmdSeal([]string) error {
-	st, _, err := loadLock()
+	st, lk, err := loadLock()
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(os.Stderr, "Sealing cannot be undone: the password is replaced and no copy is kept.\nType seal to go ahead: ")
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	if strings.TrimSpace(line) != "seal" {
-		return errors.New("not sealed")
+	if lk.Cooloff >= 0 {
+		fmt.Fprint(os.Stderr, "Sealing cannot be undone. The password is replaced and no copy is kept,\nso this program can never remove itself, and it starts restoring anything\nof its own that is deleted or stopped.\nType seal to go ahead: ")
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		if strings.TrimSpace(line) != "seal" {
+			return errors.New("not sealed")
+		}
+		sealed, err := newLock(newPassword(), 0, true)
+		if err != nil {
+			return err
+		}
+		if err := st.write("lock.json", sealed); err != nil {
+			return err
+		}
 	}
-	sealed, err := newLock(newPassword(), 0, true)
-	if err != nil {
-		return err
+	if err := arm(st); err != nil {
+		return fmt.Errorf("sealed, but the guard did not start: %w", err)
 	}
-	if err := st.write("lock.json", sealed); err != nil {
-		return err
-	}
-	fmt.Println("Sealed. Adding to the policy and appeals still work; nothing can be removed.")
+	fmt.Println("Sealed and guarded. Adding to the policy and appeals still work; nothing can be removed.")
 	return nil
 }
 

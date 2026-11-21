@@ -102,7 +102,12 @@ func (l *lock) remaining(now time.Time) (time.Duration, error) {
 	return max(left, 0), nil
 }
 
-type store struct{ dir string }
+// store is the state directory. A non-zero flag means the installation is
+// sealed and its files are kept immutable between writes.
+type store struct {
+	dir  string
+	flag uint32
+}
 
 func (s *store) path(name string) string { return filepath.Join(s.dir, name) }
 
@@ -119,11 +124,20 @@ func (s *store) write(name string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path(name + ".tmp")
+	tmp, target := s.path(name+".tmp"), s.path(name)
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path(name))
+	unprotect(target, s.flag)
+	if err := os.Rename(tmp, target); err != nil {
+		// The guard may have re-flagged the file in between; once more.
+		unprotect(target, s.flag)
+		if err = os.Rename(tmp, target); err != nil {
+			return err
+		}
+	}
+	protect(target, s.flag)
+	return nil
 }
 
 func (s *store) config() config {
