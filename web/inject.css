@@ -49,15 +49,35 @@ ytd-watch-flexy #secondary:not(:has(ytd-playlist-panel-renderer:not([hidden]), y
 .ytp-autonav-toggle-button-container,
 .ytp-next-button,
 
-/* Search results: Shorts, suggestion shelves, ads. */
+/* Search results: Shorts and suggestion shelves. */
 ytd-reel-shelf-renderer,
 ytd-rich-shelf-renderer,
 ytd-search ytd-shelf-renderer,
 ytd-search grid-shelf-view-model,
 ytd-search ytd-horizontal-card-list-renderer,
 ytd-search ytd-video-renderer:has(a[href^="/shorts/"]),
+
+/* Ads and promotions. The proxy removes their data; this is for any that
+   arrive by a route it does not rewrite. */
 ytd-ad-slot-renderer,
-ytd-in-feed-ad-layout-renderer {
+ytd-in-feed-ad-layout-renderer,
+ytd-rich-item-renderer:has(ytd-ad-slot-renderer),
+ytd-search-pyv-renderer,
+ytd-promoted-sparkles-web-renderer,
+ytd-promoted-video-renderer,
+ytd-compact-promoted-video-renderer,
+ytd-display-ad-renderer,
+ytd-action-companion-ad-renderer,
+ytd-companion-slot-renderer,
+ytd-player-legacy-desktop-watch-ads-renderer,
+ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-ads"],
+#masthead-ad,
+#shopping-timely-shelf,
+#sticker-layer,
+yt-overlay-product-sticker,
+.ytp-suggested-action > .ytp-suggested-action-badge,
+.ytp-ad-overlay-container,
+#toast:has(> #text-container > yt-formatted-string#text.yt-notification-action-renderer) {
   display: none !important;
 }
 

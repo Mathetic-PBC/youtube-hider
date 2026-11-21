@@ -32,6 +32,7 @@ const usage = `ythider: YouTube as a search bar, gated by a local model.
   sudo ythider reveal             show the password once the cool-off has passed
   sudo ythider unlock             remove everything (asks for the password)
   sudo ythider relock             replace a revealed password with a new unknown one
+  sudo ythider seal               give up the way out: new password, no copy kept
        ythider eval --policy FILE QUERIES.tsv   measure the classifier on labeled queries
        ythider serve --dev --state DIR --listen ADDR   run unprivileged for development
 `
@@ -51,6 +52,7 @@ func main() {
 		"reveal":         cmdReveal,
 		"unlock":         cmdUnlock,
 		"relock":         cmdRelock,
+		"seal":           cmdSeal,
 		"eval":           cmdEval,
 	}
 	cmd, ok := cmds[os.Args[1]]
@@ -199,7 +201,7 @@ func cmdStatus([]string) error {
 	}
 	switch left, err := lk.remaining(time.Now()); {
 	case lk.Cooloff < 0:
-		fmt.Println("unlock:    password was not kept (--cooloff never)")
+		fmt.Println("unlock:    sealed; no copy of the password exists")
 	case err != nil:
 		fmt.Printf("unlock:    locked; cool-off is %s once requested\n", time.Duration(lk.Cooloff)*time.Second)
 	case left > 0:
@@ -304,6 +306,30 @@ func cmdRelock([]string) error {
 		return err
 	}
 	fmt.Println("Locked again with a new password that was not shown.")
+	return nil
+}
+
+// cmdSeal replaces the password with a new one and keeps no copy, so the
+// lock can no longer be opened through this program. It only ever tightens,
+// which is why it does not ask for the current password.
+func cmdSeal([]string) error {
+	st, _, err := loadLock()
+	if err != nil {
+		return err
+	}
+	fmt.Fprint(os.Stderr, "Sealing cannot be undone: the password is replaced and no copy is kept.\nType seal to go ahead: ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if strings.TrimSpace(line) != "seal" {
+		return errors.New("not sealed")
+	}
+	sealed, err := newLock(newPassword(), 0, true)
+	if err != nil {
+		return err
+	}
+	if err := st.write("lock.json", sealed); err != nil {
+		return err
+	}
+	fmt.Println("Sealed. Adding to the policy and appeals still work; nothing can be removed.")
 	return nil
 }
 

@@ -93,7 +93,7 @@ func (l *lock) verify(password string) bool {
 // remaining reports how long until the password may be revealed.
 func (l *lock) remaining(now time.Time) (time.Duration, error) {
 	if l.Cooloff < 0 {
-		return 0, errors.New("this lock was installed with --cooloff never: the password was not kept")
+		return 0, errors.New("this lock is sealed: no copy of the password exists")
 	}
 	if l.RequestedAt == nil {
 		return 0, errors.New("no unlock requested; run `request-unlock` to start the cool-off")

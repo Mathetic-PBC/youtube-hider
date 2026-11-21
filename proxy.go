@@ -244,6 +244,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		io.WriteString(w, "self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.registration.unregister()));")
 		return
+	case adPath(path):
+		// Ad fetches, ad breaks and ad tracking. Answered empty, never sent.
+		w.WriteHeader(http.StatusNoContent)
+		return
 	case path == "/complete/search":
 		// Search suggestions: the box takes what is typed and proposes nothing.
 		w.WriteHeader(http.StatusNoContent)
@@ -286,6 +290,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && path == "/youtubei/v1/get_watch":
 		// In-page navigation to a video: player data and watch-page data.
 		pl, rewrite = plan{mode: pruneWatch, judge: true, watch: true}, true
+	case r.Method == http.MethodPost && path == "/youtubei/v1/navigation/resolve_url":
+		// Resolving a link can come back with the video's player data
+		// attached, ads included.
+		pl, rewrite = plan{judge: true}, true
 	case r.Method == http.MethodPost && path == "/youtubei/v1/player":
 		// Player data on its own: embeds, hover previews. No video plays
 		// without one of these responses, so judging them covers every route.
@@ -298,6 +306,18 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(context.WithValue(r.Context(), planKey{}, pl))
 	}
 	s.proxy.ServeHTTP(w, r)
+}
+
+// Paths on YouTube's own hostnames that exist only to serve or count ads.
+var adPaths = []string{"/pagead", "/ptracking", "/api/stats/ads", "/get_midroll_info", "/youtubei/v1/player/ad_break"}
+
+func adPath(path string) bool {
+	for _, p := range adPaths {
+		if hasPathPrefix(path, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func blockedPath(path string) bool {

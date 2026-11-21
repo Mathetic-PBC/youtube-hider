@@ -15,6 +15,8 @@ against what you said you come to YouTube for.
   model in about a quarter of a second, whether you searched for it, clicked
   it, or followed a link from somewhere else. What doesn't fit gets a
   "Not approved" page with the model's reason and how sure it was.
+- **Ads** are removed: the schedule that tells the player which ads to play
+  is deleted before the page sees it, so there is nothing to skip.
 - **Turning it off** needs a password that was generated for you and never
   shown.
 
@@ -93,6 +95,29 @@ from every "Not approved" page.
   "tech reviews" to what's let through does not undo having it in what's
   kept out.
 
+## Ads
+
+A video's player data arrives with a schedule of ads: which to fetch and when
+to play them. The proxy deletes that schedule (`adPlacements`, `playerAds`,
+`adSlots`, `adBreakHeartbeatParams`) from every response that carries player
+data, drops ad entries from result lists, and answers YouTube's own ad and
+ad-tracking endpoints with nothing. This is the same removal browser ad
+blockers perform inside the page, done one step earlier.
+
+Two things it does not do:
+
+- **It does not make YouTube forget an ad was due.** When the server had an
+  ad scheduled and none is played, its stream server sometimes holds the
+  video back for a few seconds. In testing on heavily monetized videos this
+  showed up as a 4 to 9 second wait before some plays, and no wait before
+  others. No ad played in any of them.
+- **It cannot delete an ad that is spliced into the video stream itself.**
+  For that case the injected script watches the player and, if it reports an
+  ad, mutes it, jumps to its end and presses skip.
+
+YouTube changes this regularly. The field names are in `rewrite.go` and the
+in-page fallback in `web/inject.js`.
+
 ## Appeals
 
 Each verdict comes with a confidence from 0 to 100. A block under 95 can be
@@ -127,6 +152,11 @@ sudo ythider relock           # after a reveal: new password, not shown
 `sudo ythider install --cooloff 72h` sets a different wait.
 `--cooloff never` keeps no copy of the password at all, so there is nothing
 to reveal.
+
+`sudo ythider seal` does the same to a copy that is already installed: it
+replaces the password with a new one and keeps no copy. After that none of
+the commands above can open the lock, the policy can only be added to, and
+there is no undoing it.
 
 ## What it does not stop
 

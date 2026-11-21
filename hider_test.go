@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -223,6 +224,55 @@ func TestSuggestionsAndSideNavigationAreEmpty(t *testing.T) {
 	}
 }
 
+func TestAdsAreStripped(t *testing.T) {
+	s, up := testServer(t, somePolicy)
+	api := map[string]string{"Sec-Fetch-Mode": "same-origin"}
+	const ads = `"adPlacements":[{"adPlacementRenderer":{}}],"playerAds":[{}],"adSlots":[{}],"adBreakHeartbeatParams":"x"`
+	const video = `"videoDetails":{"videoId":"v1","title":"a lecture","author":"c"},"streamingData":{"serverAbrStreamingUrl":"https://example/a?b=1\u0026c=2"}`
+
+	// Player data fetched by the page.
+	up.json = `{` + ads + `,` + video + `}`
+	w := do(s, "POST", "/youtubei/v1/player", "{}", api)
+	for _, key := range []string{"adPlacements", "playerAds", "adSlots", "adBreakHeartbeatParams"} {
+		if strings.Contains(w.Body.String(), key) {
+			t.Errorf("player response still carries %s", key)
+		}
+	}
+	var got struct {
+		StreamingData struct{ ServerAbrStreamingUrl string }
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || got.StreamingData.ServerAbrStreamingUrl != "https://example/a?b=1&c=2" {
+		t.Errorf("the video's own stream data did not survive: %v %+v", err, got)
+	}
+
+	// Player data embedded in a page.
+	up.html = `<html><head><script>var ytInitialPlayerResponse = {` + ads + `,` + video + `};</script></head></html>`
+	if body := do(s, "GET", "/watch?v=v1", "", nil).Body.String(); strings.Contains(body, "adPlacements") || !strings.Contains(body, `"videoId":"v1"`) {
+		t.Errorf("page still carries its ad schedule, or lost the video")
+	}
+
+	// Ad entries mixed into a list of results.
+	up.json = `{"contents":[{"adSlotRenderer":{}},{"videoRenderer":{"id":"keep"}},{"promotedSparklesWebRenderer":{}}]}`
+	if body := do(s, "POST", "/youtubei/v1/browse", `{"browseId":"UCx"}`, api).Body.String(); body != `{"contents":[{"videoRenderer":{"id":"keep"}}]}` {
+		t.Errorf("list ads: got %s", body)
+	}
+
+	// Ad endpoints are answered empty and never reach YouTube.
+	before := len(up.paths)
+	for _, p := range []string{"/pagead/adview?x=1", "/ptracking?y", "/api/stats/ads?z", "/youtubei/v1/player/ad_break"} {
+		method := "GET"
+		if strings.HasPrefix(p, "/youtubei") {
+			method = "POST"
+		}
+		if w := do(s, method, p, "", api); w.Code != http.StatusNoContent {
+			t.Errorf("%s: got %d, want 204", p, w.Code)
+		}
+	}
+	if len(up.paths) != before {
+		t.Errorf("ad requests reached YouTube: %v", up.paths[before:])
+	}
+}
+
 func TestEveryRouteToAVideoIsJudged(t *testing.T) {
 	s, up := testServer(t, somePolicy)
 	api := map[string]string{"Sec-Fetch-Mode": "same-origin"}
@@ -421,10 +471,10 @@ func TestLockCooloff(t *testing.T) {
 		t.Fatalf("after 25h: %s, %v", left, err)
 	}
 
-	never, _ := newLock(pw, 0, true)
-	never.RequestedAt = &now
-	if _, err := never.remaining(now.Add(1000 * time.Hour)); err == nil || never.Sealed != "" {
-		t.Fatal("--cooloff never kept or revealed the password")
+	sealed, _ := newLock(pw, 0, true)
+	sealed.RequestedAt = &now
+	if _, err := sealed.remaining(now.Add(1000 * time.Hour)); err == nil || sealed.Sealed != "" {
+		t.Fatal("a sealed lock kept or revealed the password")
 	}
 }
 

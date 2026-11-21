@@ -24,18 +24,59 @@ var watchKeys = map[string]bool{
 	"autoplay":         true,
 }
 
-// Renderers dropped from search results: Shorts shelves, "people also
-// watched" style shelves, and ads. Ordinary results are left alone.
+// Renderers dropped from search results: Shorts shelves and "people also
+// watched" style shelves. Ordinary results are left alone.
 var searchRenderers = map[string]bool{
 	"reelShelfRenderer":          true,
 	"shelfRenderer":              true,
 	"richShelfRenderer":          true,
 	"gridShelfViewModel":         true,
 	"horizontalCardListRenderer": true,
-	"adSlotRenderer":             true,
 }
 
-// prune walks decoded JSON and removes recommendation data in place.
+// Ads are removed from every response, whatever the mode.
+//
+// adKeys are the fields of a player response that tell the player which ads
+// to fetch and when to play them. With them gone the player has no ad to
+// request: nothing is skipped or hidden, because nothing was scheduled.
+var adKeys = map[string]bool{
+	"adPlacements":           true,
+	"playerAds":              true,
+	"adSlots":                true,
+	"adBreakHeartbeatParams": true,
+}
+
+// adRenderers are the ad and promotion entries mixed into lists of results.
+var adRenderers = map[string]bool{
+	"adSlotRenderer":                      true,
+	"inFeedAdLayoutRenderer":              true,
+	"searchPyvRenderer":                   true,
+	"promotedSparklesWebRenderer":         true,
+	"promotedVideoRenderer":               true,
+	"compactPromotedVideoRenderer":        true,
+	"playerLegacyDesktopWatchAdsRenderer": true,
+	"merchandiseShelfRenderer":            true,
+}
+
+// adMarkers decide whether a body is worth decoding when nothing else in it
+// needs rewriting.
+var adMarkers = [][]byte{
+	[]byte(`"adPlacements"`), []byte(`"playerAds"`), []byte(`"adSlots"`), []byte(`"adBreakHeartbeatParams"`),
+	[]byte(`"adSlotRenderer"`), []byte(`"inFeedAdLayoutRenderer"`), []byte(`"searchPyvRenderer"`),
+	[]byte(`romotedSparklesWebRenderer"`), []byte(`romotedVideoRenderer"`),
+	[]byte(`"playerLegacyDesktopWatchAdsRenderer"`), []byte(`"merchandiseShelfRenderer"`),
+}
+
+func hasAds(body []byte) bool {
+	for _, m := range adMarkers {
+		if bytes.Contains(body, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// prune walks decoded JSON and removes ads and recommendation data in place.
 func prune(v any, mode pruneMode) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -43,6 +84,10 @@ func prune(v any, mode pruneMode) any {
 		// playlist panel does not render without it.
 		_, inPlaylist := t["playlist"]
 		for k, child := range t {
+			if adKeys[k] {
+				delete(t, k)
+				continue
+			}
 			if mode == pruneWatch && watchKeys[k] && !(k == "autoplay" && inPlaylist) {
 				if _, isObj := child.(map[string]any); isObj {
 					// Emptied, not deleted: the page expects the key to exist.
@@ -56,7 +101,7 @@ func prune(v any, mode pruneMode) any {
 	case []any:
 		out := t[:0]
 		for _, el := range t {
-			if mode == pruneSearch && isRenderer(el, searchRenderers) {
+			if isRenderer(el, adRenderers) || (mode == pruneSearch && isRenderer(el, searchRenderers)) {
 				continue
 			}
 			out = append(out, prune(el, mode))
@@ -81,7 +126,7 @@ func isRenderer(v any, names map[string]bool) bool {
 // body is returned unchanged: the injected stylesheet still hides the same
 // regions, so a schema surprise degrades to hidden rather than broken.
 func pruneJSON(body []byte, mode pruneMode) []byte {
-	if mode == pruneNone {
+	if mode == pruneNone && !hasAds(body) {
 		return body
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -104,10 +149,11 @@ var (
 )
 
 // rewriteHTML injects the hiding stylesheet and script into a YouTube page
-// and prunes the recommendation data embedded in it.
+// and prunes the ads and recommendation data embedded in it.
 func rewriteHTML(body []byte, mode pruneMode, css, js []byte) []byte {
-	if mode != pruneNone {
-		body = pruneInitialData(body, mode)
+	if mode != pruneNone || hasAds(body) {
+		body = pruneEmbedded(body, initialDataMark, mode)
+		body = pruneEmbedded(body, playerMark, pruneNone)
 	}
 	loc := headRe.FindIndex(body)
 	if loc == nil {
@@ -131,12 +177,14 @@ func rewriteHTML(body []byte, mode pruneMode, css, js []byte) []byte {
 	return out
 }
 
-func pruneInitialData(body []byte, mode pruneMode) []byte {
-	i := bytes.Index(body, initialDataMark)
+// pruneEmbedded prunes the JSON object a page assigns after mark: the page
+// data (ytInitialData) or the player data (ytInitialPlayerResponse).
+func pruneEmbedded(body, mark []byte, mode pruneMode) []byte {
+	i := bytes.Index(body, mark)
 	if i < 0 {
 		return body
 	}
-	start := i + len(initialDataMark)
+	start := i + len(mark)
 	if start >= len(body) || body[start] != '{' {
 		return body
 	}
